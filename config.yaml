@@ -1,0 +1,170 @@
+# ============================================================================
+# Med-Image CompareNet — Master Configuration
+# ============================================================================
+# All hyperparameters, paths, and settings in one place.
+# No hardcoded values anywhere in the codebase.
+# ============================================================================
+
+project:
+  name: "Med-Image CompareNet"
+  version: "1.0.0"
+  description: "Comparative Deep Learning Framework for Medical Image Analysis"
+  seed: 42 # Global random seed for reproducibility
+
+# ---------------------------------------------------------------------------
+# Dataset Configuration
+# ---------------------------------------------------------------------------
+data:
+  xray:
+    name: "chest_xray" # Kaggle: paultimothymooney/chest-xray-pneumonia
+    root_dir: "data/chest_xray"
+    classes: ["NORMAL", "PNEUMONIA"]
+    num_classes: 2
+    image_size: 224
+    # Train/Val/Test split ratios (used only if manual splitting is needed)
+    train_ratio: 0.7
+    val_ratio: 0.15
+    test_ratio: 0.15
+
+  pathology:
+    name: "breast_histopathology" # Kaggle: paultimothymooney/breast-histopathology-images
+    root_dir: "data/breast_histopathology"
+    classes: ["benign", "malignant"]
+    num_classes: 2
+    patch_size: 50 # Original IDC patches are 50x50
+    image_size: 224 # Resize to 224x224 for model input
+    max_patches_per_class: 20000 # Cap to balance classes
+
+  # Pre-loaded demo samples for the live dashboard
+  demo_samples_dir: "data/demo_samples"
+  num_demo_samples: 5
+
+# ---------------------------------------------------------------------------
+# Enhancement Module (Module 1) — U-Net + GAN Denoising
+# ---------------------------------------------------------------------------
+enhancement:
+  model: "unet_gan"
+  noise_level: 25 # Gaussian noise sigma for synthetic training
+  unet:
+    in_channels: 1 # Grayscale X-rays
+    out_channels: 1
+    features: [64, 128, 256, 512] # Encoder feature dimensions
+  gan:
+    lambda_pixel: 100.0 # L1 pixel loss weight
+    lambda_perceptual: 1.0 # Perceptual loss weight
+    lambda_adversarial: 1.0 # GAN adversarial loss weight
+  training:
+    epochs: 50
+    batch_size: 8
+    learning_rate: 0.0002
+    beta1: 0.5
+    beta2: 0.999
+    lr_scheduler: "cosine"
+    save_interval: 5 # Save checkpoint every N epochs
+
+# ---------------------------------------------------------------------------
+# CNN Classification Module (Module 2) — ResNet-50 & DenseNet-121
+# ---------------------------------------------------------------------------
+cnn:
+  models:
+    - name: "resnet50"
+      pretrained: true # ImageNet pre-trained weights
+      freeze_layers: 0 # Number of layers to freeze (0 = full fine-tune)
+    - name: "densenet121"
+      pretrained: true
+      freeze_layers: 0
+
+  training:
+    epochs: 30
+    batch_size: 32
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    optimizer: "adam"
+    lr_scheduler: "step"
+    lr_step_size: 10
+    lr_gamma: 0.1
+    early_stopping_patience: 7
+    num_workers: 4
+
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: false
+    rotation_range: 15
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      hue: 0.05
+    random_erasing_prob: 0.1
+
+# ---------------------------------------------------------------------------
+# Vision Transformer Module (Module 3) — ViT-B/16
+# ---------------------------------------------------------------------------
+vit:
+  model_name: "google/vit-base-patch16-224"
+  patch_size: 16
+  pretrained: true
+
+  training:
+    epochs: 30
+    batch_size: 16 # ViT needs more GPU memory
+    learning_rate: 0.00005 # Lower LR for transformer fine-tuning
+    weight_decay: 0.01
+    optimizer: "adamw"
+    warmup_steps: 500
+    lr_scheduler: "cosine_warmup"
+    early_stopping_patience: 7
+    num_workers: 4
+    gradient_accumulation_steps: 2
+
+  # Patch-based inference for pathology whole-slide images
+  patch_inference:
+    voting_strategy: "majority" # "majority" or "weighted_confidence"
+    confidence_threshold: 0.6
+    overlap: 0.25 # 25% overlap between patches
+
+# ---------------------------------------------------------------------------
+# Explainable AI Module (Module 4) — Grad-CAM + Attention Rollout
+# ---------------------------------------------------------------------------
+xai:
+  gradcam:
+    target_layers:
+      resnet50: "layer4" # Last conv block
+      densenet121: "features.denseblock4"
+    colormap: "jet"
+    alpha: 0.5 # Overlay transparency
+
+  attention_rollout:
+    head_fusion: "mean" # "mean", "max", or "min"
+    discard_ratio: 0.9 # Top 10% attention kept
+
+  pointing_game:
+    tolerance: 15 # Pixel tolerance for "hit"
+
+# ---------------------------------------------------------------------------
+# Dashboard Configuration
+# ---------------------------------------------------------------------------
+dashboard:
+  host: "0.0.0.0"
+  port: 8501
+  theme: "dark" # Default theme: "dark" or "light"
+  max_upload_size_mb: 50
+  cache_ttl: 3600 # Cache results for 1 hour
+
+# ---------------------------------------------------------------------------
+# Paths (auto-created if missing)
+# ---------------------------------------------------------------------------
+paths:
+  checkpoints: "checkpoints"
+  logs: "logs"
+  results: "results"
+  exports: "exports"
+  figures: "figures"
+
+# ---------------------------------------------------------------------------
+# Hardware / Device
+# ---------------------------------------------------------------------------
+device:
+  use_cuda: true # Falls back to CPU if unavailable
+  mixed_precision: true # FP16 training for speed
+  gpu_id: 0
