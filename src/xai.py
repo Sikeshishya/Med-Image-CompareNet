@@ -118,7 +118,15 @@ class GradCAM:
         colormap: str = "jet", alpha: float = 0.5,
     ) -> np.ndarray:
         """Overlay heatmap on original image."""
+        # Downscale to prevent Out-Of-Memory on large inputs
+        max_dim = 512
         h, w = image.shape[:2]
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h, w = new_h, new_w
+            
         heatmap_resized = cv2.resize(heatmap, (w, h))
         
         # Apply colormap
@@ -223,7 +231,15 @@ class AttentionRollout:
         colormap: str = "inferno", alpha: float = 0.5,
     ) -> np.ndarray:
         """Overlay attention map on original image."""
+        # Downscale to prevent Out-Of-Memory on large inputs
+        max_dim = 512
         h, w = image.shape[:2]
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            h, w = new_h, new_w
+            
         attn_resized = cv2.resize(attention_map, (w, h), interpolation=cv2.INTER_CUBIC)
         
         cmap = plt.get_cmap(colormap)

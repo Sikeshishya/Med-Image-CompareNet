@@ -102,18 +102,34 @@ def download_demo_images():
             paths.append(path)
     return paths
 
-@st.cache_resource
+@st.cache_resource(max_entries=6)
 def load_model_for_inference_v2(model_type, model_name, dataset):
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     try:
         from src.utils import load_config
         config = load_config("config.yaml")
         ds_name = "xray" if "X-Ray" in dataset else "pathology"
-        m_name = "resnet50" if "ResNet" in model_name else "densenet121" if "DenseNet" in model_name else "vit"
+        # Normalize model name to checkpoint key
+        name_lower = model_name.lower()
+        if "resnet" in name_lower:
+            m_name = "resnet50"
+        elif "dense" in name_lower:
+            m_name = "densenet121"
+        else:
+            m_name = "vit"
         
         ckpt_path = f"checkpoints/{m_name}_{ds_name}_best.pth"
-        if not os.path.exists(ckpt_path): return None, None, None
+        if not os.path.exists(ckpt_path):
+            return None, None, None
         
-        if model_type == "cnn":
+        # Determine model type from the name, not the passed argument
+        is_vit = (m_name == "vit")
+        
+        if not is_vit:
             from src.cnn_model import build_cnn_model
             model = build_cnn_model(m_name, 2, pretrained=False)
         else:
@@ -125,7 +141,11 @@ def load_model_for_inference_v2(model_type, model_name, dataset):
                 attn_implementation="eager"
             )
             
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        except Exception:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            
         if "model" in ckpt:
             model.load_state_dict(ckpt["model"])
         elif "model_state_dict" in ckpt:
@@ -139,11 +159,13 @@ def load_model_for_inference_v2(model_type, model_name, dataset):
         return None, None, None
 
 def transform_image(image_np, is_vit=False):
-    """Transform image for model input."""
+    """Transform image for model input. Enables gradients for Grad-CAM."""
     from src.datasets import get_transforms
     tf = get_transforms(224, is_training=False)
     img = Image.fromarray(image_np).convert("RGB")
-    return tf(img).unsqueeze(0)
+    tensor = tf(img).unsqueeze(0)
+    tensor.requires_grad_(True)  # Required for Grad-CAM backward pass
+    return tensor
 
 # ── Sidebar ──
 def render_sidebar():
@@ -166,14 +188,14 @@ def render_sidebar():
         
         st.markdown("---")
         st.markdown("### ⚙️ Model Selector")
-        cnn_model = st.selectbox("CNN Model", ["ResNet-50", "DenseNet-121"])
+        selected_model = st.selectbox("Model", ["ResNet-50", "DenseNet-121", "ViT-B/16"])
         dataset = st.selectbox("Dataset", ["X-Ray (Pneumonia)", "Pathology (IDC)"])
         
         st.markdown("---")
         st.markdown(f"🕐 {datetime.now().strftime('%H:%M:%S')}")
         st.markdown("v1.0.0 | PyTorch + HuggingFace")
         
-    return page, cnn_model, dataset, dark_mode
+    return page, selected_model, dataset, dark_mode
 
 # ── Pages ──
 def page_overview():
@@ -197,10 +219,14 @@ def page_overview():
     # Show checkpoint status
     if available_ckpts:
         st.markdown("### ✅ Available Checkpoints")
-        ckpt_cols = st.columns(len(available_ckpts))
-        for i, ckpt in enumerate(sorted(available_ckpts)):
-            name = ckpt.replace("_best.pth", "").replace("_", " ").title()
-            ckpt_cols[i].success(f"✅ {name}")
+        # Use max 3 columns per row to avoid cramped layout
+        sorted_ckpts = sorted(available_ckpts)
+        for row_start in range(0, len(sorted_ckpts), 3):
+            row_ckpts = sorted_ckpts[row_start:row_start + 3]
+            ckpt_cols = st.columns(len(row_ckpts))
+            for i, ckpt in enumerate(row_ckpts):
+                name = ckpt.replace("_best.pth", "").replace("_", " ").title()
+                ckpt_cols[i].success(f"✅ {name}")
     
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -221,115 +247,143 @@ def page_overview():
         - Plain-English clinical interpretations
         """)
 
-def page_live_inference(cnn_model_name, dataset_name):
-    st.markdown("## 🔬 Live Inference")
-    st.markdown(f"Running real-time inference with **{cnn_model_name}** and **ViT-B/16** on **{dataset_name}**.")
+def page_live_inference(selected_model_name, dataset_name):
+    is_vit_primary = "ViT" in selected_model_name
+    if is_vit_primary:
+        st.markdown("## 🔬 Live Inference")
+        st.markdown(f"Running real-time inference with **ViT-B/16** and comparing against CNNs on **{dataset_name}**.")
+    else:
+        st.markdown("## 🔬 Live Inference")
+        st.markdown(f"Running real-time inference with **{selected_model_name}** and **ViT-B/16** on **{dataset_name}**.")
     
     tab1, tab2 = st.tabs(["📤 Upload Image", "🖼️ Demo Samples"])
     
-    image_to_run = None
+    # Use session state to persist image across tab interactions
+    if "inference_image" not in st.session_state:
+        st.session_state.inference_image = None
     
     with tab1:
         uploaded = st.file_uploader("Upload a medical image", type=["jpg", "jpeg", "png"])
         if uploaded:
-            image_to_run = np.array(Image.open(uploaded).convert("RGB"))
-            st.image(image_to_run, caption="Uploaded Image", width=300)
+            st.session_state.inference_image = np.array(Image.open(uploaded).convert("RGB"))
+            st.image(st.session_state.inference_image, caption="Uploaded Image", width=300)
     
     with tab2:
         st.markdown("### Pre-loaded Real Samples")
         demo_paths = download_demo_images()
         if demo_paths:
-            cols = st.columns(len(demo_paths))
+            cols = st.columns(2)
             for i, path in enumerate(demo_paths):
                 img = np.array(Image.open(path).convert("RGB"))
-                lbl = "X-Ray" if "xray" in path else "Pathology"
-                with cols[i]:
+                lbl = "X-Ray" if "xray" in path.lower() else "Pathology"
+                with cols[i % 2]:
                     st.image(img, caption=lbl, use_container_width=True)
-                    if st.button(f"Analyze", key=f"demo_{i}"):
-                        image_to_run = img
+                    if st.button(f"Analyze {lbl}", key=f"demo_{i}"):
+                        st.session_state.inference_image = img
         else:
             st.info("No demo images found. Please upload one.")
             
-    if image_to_run is not None:
+    if st.session_state.inference_image is not None:
         st.markdown("---")
-        run_real_inference(image_to_run, cnn_model_name, dataset_name)
+        run_real_inference(st.session_state.inference_image, selected_model_name, dataset_name)
 
-def run_real_inference(image_np, cnn_name, dataset_name):
-    """Run real CNN and ViT inference side-by-side using saved checkpoints."""
+def run_real_inference(image_np, selected_model_name, dataset_name):
+    """Run inference side-by-side using saved checkpoints.
+    
+    If a CNN is selected, show CNN on the left and ViT on the right.
+    If ViT is selected, show ViT on the left and ResNet-50 (default CNN) on the right.
+    """
+    is_vit_primary = "ViT" in selected_model_name
     col1, col2 = st.columns(2)
     
-    # Load Models
-    cnn, ds_key, m_key = load_model_for_inference_v2("cnn", cnn_name, dataset_name)
-    vit, _, _ = load_model_for_inference_v2("vit", "vit", dataset_name)
+    # Determine which models to load
+    if is_vit_primary:
+        # ViT is selected as primary — compare against ResNet-50 as the CNN baseline
+        vit, ds_key, _ = load_model_for_inference_v2("vit", "ViT-B/16", dataset_name)
+        cnn, _, cnn_m_key = load_model_for_inference_v2("cnn", "ResNet-50", dataset_name)
+        cnn_display_name = "ResNet-50"
+    else:
+        cnn, ds_key, cnn_m_key = load_model_for_inference_v2("cnn", selected_model_name, dataset_name)
+        vit, _, _ = load_model_for_inference_v2("vit", "ViT-B/16", dataset_name)
+        cnn_display_name = selected_model_name
+    
+    # Fallback dataset key detection
+    if ds_key is None:
+        ds_key = "xray" if "X-Ray" in dataset_name else "pathology"
     
     input_tensor = transform_image(image_np)
     classes = ["NORMAL", "PNEUMONIA"] if ds_key == "xray" else ["BENIGN", "MALIGNANT"]
     
-    with col1:
-        st.markdown(f"### 🧬 CNN: {cnn_name}")
-        if cnn is not None:
-            with st.spinner("Running CNN inference..."):
-                start = time.time()
-                with torch.no_grad():
-                    out = cnn(input_tensor)
-                inf_time = (time.time() - start) * 1000
-                probs = torch.softmax(out, dim=1)[0]
-                pred_idx = probs.argmax().item()
-                conf = probs[pred_idx].item()
+    # Decide column order based on primary selection
+    if is_vit_primary:
+        left_label, right_label = "🤖 ViT-B/16 (Primary)", f"🧬 CNN: {cnn_display_name}"
+        left_model, right_model = vit, cnn
+        left_is_vit, right_is_vit = True, False
+    else:
+        left_label, right_label = f"🧬 CNN: {cnn_display_name}", "🤖 ViT-B/16"
+        left_model, right_model = cnn, vit
+        left_is_vit, right_is_vit = False, True
+    
+    def _run_single_model(column, model, label, is_vit, m_key=None):
+        with column:
+            st.markdown(f"### {label}")
+            if model is not None:
+                spinner_text = "Running ViT inference..." if is_vit else "Running CNN inference..."
+                with st.spinner(spinner_text):
+                    start = time.time()
+                    with torch.no_grad():
+                        out = model(input_tensor).logits if is_vit else model(input_tensor)
+                    inf_time = (time.time() - start) * 1000
+                    probs = torch.softmax(out, dim=1)[0]
+                    pred_idx = probs.argmax().item()
+                    conf = probs[pred_idx].item()
                 
-            st.success(f"**Prediction: {classes[pred_idx]}** ({conf*100:.1f}% confidence)")
-            st.markdown(f"Inference time: `{inf_time:.1f} ms`")
-            
-            # Real GradCAM
-            from src.xai import GradCAM
-            target_layer = "layer4" if "resnet" in m_key else "features.denseblock4"
-            try:
-                gcam = GradCAM(cnn, target_layer)
-                heatmap = gcam.generate(input_tensor, pred_idx)
-                overlay = gcam.overlay_on_image(image_np, heatmap)
-                st.image(overlay, caption="Real Grad-CAM Heatmap", use_container_width=True)
-            except Exception as e:
-                st.error(f"Grad-CAM failed: {e}")
-        else:
-            st.error(f"Could not load {cnn_name} checkpoint. Train it first!")
-            
-    with col2:
-        st.markdown("### 🤖 ViT-B/16")
-        if vit is not None:
-            with st.spinner("Running ViT inference..."):
-                start = time.time()
-                with torch.no_grad():
-                    out = vit(input_tensor).logits
-                inf_time = (time.time() - start) * 1000
-                probs = torch.softmax(out, dim=1)[0]
-                pred_idx = probs.argmax().item()
-                conf = probs[pred_idx].item()
+                st.success(f"**Prediction: {classes[pred_idx]}** ({conf*100:.1f}% confidence)")
+                st.markdown(f"Inference time: `{inf_time:.1f} ms`")
                 
-            st.success(f"**Prediction: {classes[pred_idx]}** ({conf*100:.1f}% confidence)")
-            st.markdown(f"Inference time: `{inf_time:.1f} ms`")
-            
-            # Real Attention Rollout
-            try:
-                from src.xai import AttentionRollout
-                vit.config.output_attentions = True
-                with torch.no_grad():
-                    outputs = vit(input_tensor, output_attentions=True)
-                
-                if not outputs.attentions:
-                    raise ValueError("Model configuration prevented attention map generation.")
-                    
-                attentions = [a.cpu().numpy() for a in outputs.attentions]
-                rollout = AttentionRollout()
-                attn_map = rollout.compute(attentions)
-                overlay = rollout.overlay_on_image(image_np, attn_map)
-                st.image(overlay, caption="Real ViT Attention Rollout", use_container_width=True)
-            except Exception as e:
-                st.error(f"Attention Rollout failed: {e}")
-        else:
-            st.error(f"Could not load ViT checkpoint. Train it first!")
+                # XAI visualization
+                if is_vit:
+                    try:
+                        from src.xai import AttentionRollout
+                        model.config.output_attentions = True
+                        with torch.no_grad():
+                            outputs = model(input_tensor, output_attentions=True)
+                        if not outputs.attentions:
+                            raise ValueError("Model configuration prevented attention map generation.")
+                        attentions = [a.cpu().numpy() for a in outputs.attentions]
+                        rollout = AttentionRollout()
+                        attn_map = rollout.compute(attentions)
+                        overlay = rollout.overlay_on_image(image_np, attn_map)
+                        st.image(overlay, caption="Real ViT Attention Rollout", use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Attention Rollout failed: {e}")
+                else:
+                    from src.xai import GradCAM
+                    target_layer = "layer4" if (m_key and "resnet" in m_key) else "features.denseblock4"
+                    try:
+                        gcam = GradCAM(model, target_layer)
+                        heatmap = gcam.generate(input_tensor, pred_idx)
+                        overlay = gcam.overlay_on_image(image_np, heatmap)
+                        st.image(overlay, caption="Real Grad-CAM Heatmap", use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Grad-CAM failed: {e}")
+            else:
+                arch_name = "ViT" if is_vit else cnn_display_name
+                st.error(f"Could not load {arch_name} checkpoint. Train it first!")
+    
+    # Determine CNN model key for GradCAM target layer
+    if not is_vit_primary:
+        left_m_key = cnn_m_key
+        right_m_key = None
+    else:
+        left_m_key = None
+        right_m_key = cnn_m_key
+    
+    _run_single_model(col1, left_model, left_label, left_is_vit, m_key=left_m_key)
+    _run_single_model(col2, right_model, right_label, right_is_vit, m_key=right_m_key)
 
     # Rich Clinical Interpretation
-    _render_clinical_interpretation(cnn, vit, cnn_name, input_tensor, image_np, classes, ds_key)
+    _render_clinical_interpretation(cnn, vit, cnn_display_name, input_tensor, image_np, classes, ds_key)
 
 def _render_clinical_interpretation(cnn, vit, cnn_name, input_tensor, image_np, classes, ds_key):
     """Generate a rich, detailed clinical interpretation with heatmap analysis."""
@@ -626,7 +680,7 @@ def page_comparison():
     </div>
     """, unsafe_allow_html=True)
 
-def page_xai(cnn_model_name, dataset_name):
+def page_xai(selected_model_name, dataset_name):
     st.markdown("## 🧠 Explainable AI Dashboard")
     st.markdown("**Why does the AI think what it thinks?** This page reveals the inner workings of our models using visual explanations.")
     
@@ -652,8 +706,8 @@ def page_xai(cnn_model_name, dataset_name):
             st.info("Upload an image or add demo samples to `data/demo_samples/`.")
             return
     
-    st.markdown(f"### Real XAI on {cnn_model_name} & ViT")
-    run_real_inference(img_np, cnn_model_name, dataset_name)
+    st.markdown(f"### Real XAI on {selected_model_name} & ViT" if "ViT" not in selected_model_name else f"### Real XAI on ViT-B/16 & ResNet-50")
+    run_real_inference(img_np, selected_model_name, dataset_name)
     
     st.markdown("---")
     st.markdown("### 📏 Interpretability Scores")
@@ -886,12 +940,12 @@ def page_research():
 
 # ── Main Router ──
 def main():
-    page, cnn_model, dataset, dark_mode = render_sidebar()
+    page, selected_model, dataset, dark_mode = render_sidebar()
     
     if "Overview" in page: page_overview()
-    elif "Inference" in page: page_live_inference(cnn_model, dataset)
+    elif "Inference" in page: page_live_inference(selected_model, dataset)
     elif "Comparison" in page: page_comparison()
-    elif "XAI" in page: page_xai(cnn_model, dataset)
+    elif "XAI" in page: page_xai(selected_model, dataset)
     elif "Enhancement" in page: page_enhancement()
     elif "Research" in page: page_research()
 
